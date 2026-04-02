@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+.tmp.drivedownload/
+.tmp.driveupload/
+
+# Large media files
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+
+# Model weights (auto-downloaded on first run)
+*.pt
+
+# Downloads directory
+downloads/
