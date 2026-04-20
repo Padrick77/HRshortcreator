@@ -216,6 +216,8 @@ class SmartCropperGUI:
         self.confidence = tk.DoubleVar(value=0.15)
         self.start_time = tk.DoubleVar(value=0.0)
         self.duration = tk.DoubleVar(value=0.0)
+        self.zoom = tk.DoubleVar(value=1.0)
+        self.training_mode = tk.BooleanVar(value=False)
         self.progress_pct = tk.DoubleVar(value=0.0)
         self.status_text = tk.StringVar(value="Ready")
         self._downloading = False
@@ -372,6 +374,7 @@ class SmartCropperGUI:
         pairs = [
             ("Smooth", self.smoothing, 4), ("Conf", self.confidence, 5),
             ("Start(s)", self.start_time, 6), ("Dur(s)", self.duration, 6),
+            ("Zoom", self.zoom, 4),
         ]
         for i, (lbl, var, w) in enumerate(pairs):
             tk.Label(si, text=lbl, font=F["small"], bg=C["card"],
@@ -381,8 +384,20 @@ class SmartCropperGUI:
                      highlightthickness=1, highlightbackground=C["border"],
                      highlightcolor=C["accent"]).grid(row=0, column=i * 2 + 1, padx=(0, 6))
 
-        tk.Label(si, text="(dur 0 = full)", font=(FONT, 8), bg=C["card"],
+        tk.Label(si, text="(dur 0 = full, zoom 1 = no zoom)", font=(FONT, 8), bg=C["card"],
                  fg=C["text3"]).grid(row=0, column=len(pairs) * 2, padx=(0, 4))
+
+        # Training mode toggle
+        train_row = tk.Frame(settings, bg=C["card"])
+        train_row.pack(fill="x", padx=10, pady=(0, 8))
+        self.training_checkbox = tk.Checkbutton(
+            train_row, text="🏋  Training Mode Only (collect labels, skip video output)",
+            variable=self.training_mode, font=F["small"],
+            bg=C["card"], fg=C["yellow"], activebackground=C["card"],
+            activeforeground=C["yellow"], selectcolor=C["input"],
+            highlightthickness=0, cursor="hand2",
+        )
+        self.training_checkbox.pack(side="left")
 
         # Action buttons
         btns = tk.Frame(row, bg=C["bg"])
@@ -854,11 +869,15 @@ class SmartCropperGUI:
                 auto_select=False,
                 start_time=self.start_time.get(),
                 duration=self.duration.get(),
+                zoom=self.zoom.get(),
+                training_only=self.training_mode.get(),
             )
 
+            mode_label = "TRAINING ONLY" if cropper.training_only else "normal"
             self._log(f"📐 {cropper.src_width}×{cropper.src_height} → "
                       f"{cropper.out_w}×{cropper.out_h} | "
-                      f"{cropper._max_frames} frames", "info")
+                      f"{cropper._max_frames} frames | "
+                      f"zoom {cropper.zoom:.1f}x | {mode_label}", "info")
 
             self._run_loop(cropper)
 
@@ -878,35 +897,39 @@ class SmartCropperGUI:
 
     def _run_loop(self, cropper):
         t0 = time.time()
+        training_only = cropper.training_only
+
         base, ext = os.path.splitext(cropper.output_path)
         silent = f"{base}_silent{ext}"
 
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(silent, fourcc, cropper.fps,
-                                 (cropper.out_w, cropper.out_h))
+        # Skip writer in training-only mode
+        writer = None
+        if not training_only:
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            writer = cv2.VideoWriter(silent, fourcc, cropper.fps,
+                                     (cropper.out_w, cropper.out_h))
 
-        fi = 0           # frames written to output
+        fi = 0
         lost = 0
         sel = False
-        src_frame_idx = cropper._start_frame  # tracks position in the source
+        src_frame_idx = cropper._start_frame
 
         self._update_progress(0, status="Select your target...")
+        if training_only:
+            self._log("🏋  TRAINING MODE — select both bots, no video output", "warning")
         self._log("👆 Select target in the popup window...", "info")
 
         while self._processing:
-            # --- PAUSE LOOP: spin while paused, let user seek ---
             if self._paused:
                 time.sleep(0.05)
                 continue
 
-            # --- SEEK JUMP: user scrubbed while paused ---
             if self._seek_to_frame is not None:
                 target = self._seek_to_frame
                 self._seek_to_frame = None
                 abs_target = cropper._start_frame + target
                 cropper.cap.set(cv2.CAP_PROP_POS_FRAMES, abs_target)
                 src_frame_idx = abs_target
-                # Reset tracker state for clean pickup
                 cropper._prev_center = None
                 cropper._drift_cooldown = 10
                 self._log(f"⏩ Jumped to frame {target} — continuing from there.", "info")
@@ -914,7 +937,6 @@ class SmartCropperGUI:
             ret, frame = cropper.cap.read()
             if not ret:
                 break
-            # Check if we've exceeded the max frames based on source position
             frames_into_clip = int(cropper.cap.get(cv2.CAP_PROP_POS_FRAMES)) - cropper._start_frame
             if cropper.duration > 0 and frames_into_clip > cropper._max_frames:
                 break
@@ -928,15 +950,17 @@ class SmartCropperGUI:
                 cropper._target_track_id = tid
                 sel = True
                 self._log(f"✅ Mode: {mode.upper()}", "success")
-                self._update_progress(0, status="Processing...")
+                if cropper._secondary_tracker is not None:
+                    self._log("✅ Secondary bot tracker active", "success")
+                self._update_progress(0, status="Training..." if training_only else "Processing...")
 
             if cropper._tracking_mode == cropper.MODE_YOLO:
                 results = cropper.model.track(
                     frame, tracker="bytetrack.yaml", persist=True,
                     verbose=False, conf=cropper.confidence)
-                cx = cropper._get_target_center_x_yolo(results)
+                center = cropper._get_target_center_yolo(results)
             else:
-                cx = cropper._get_target_center_x_manual(frame)
+                center = cropper._get_target_center_manual(frame)
 
             # --- Check for inline ROI drag ---
             if self._pending_roi is not None:
@@ -957,7 +981,6 @@ class SmartCropperGUI:
                 self._reselect_requested = False
                 self._update_progress(pct=0, status="Reselecting target...")
                 self._log("\u27f3 Draw a new box around the target...", "info")
-
                 try:
                     _, _ = cropper._manual_roi_select(frame)
                     cropper._prev_center = None
@@ -965,49 +988,72 @@ class SmartCropperGUI:
                     cropper._drift_cooldown = 20
                     lost = 0
                     self._log("\u2705 Target reselected! Resuming...", "success")
-                    self._update_progress(pct=0, status="Processing...")
+                    self._update_progress(pct=0, status="Training..." if training_only else "Processing...")
                     self.root.after(0, lambda: self.reselect_btn.config(state="normal"))
                 except SystemExit:
                     self._log("\u26a0\ufe0f Reselect cancelled, continuing with current target.", "warning")
                     self.root.after(0, lambda: self.reselect_btn.config(state="normal"))
                 continue
 
-            if cx is not None:
-                sx = cropper.smoother.update(cx)
+            if center is not None:
+                sx = cropper.smoother_x.update(center[0])
+                sy = cropper.smoother_y.update(center[1])
                 lost = 0
             else:
-                sx = cropper.smoother.hold()
+                sx = cropper.smoother_x.hold()
+                sy = cropper.smoother_y.hold()
                 lost += 1
                 if sx is None:
                     sx = cropper.src_width / 2.0
+                if sy is None:
+                    sy = cropper.src_height / 2.0
 
-            cropped = cropper._crop_frame(frame, sx)
-            writer.write(cropped)
+            # Update secondary tracker + auto-label (for YOLO mode;
+            # manual mode handles this internally via _get_target_center_manual)
+            if cropper._tracking_mode == cropper.MODE_YOLO:
+                sec_bbox = cropper._update_secondary_tracker(frame)
+                if fi % cropper._label_save_interval == 0 and cropper._template_bbox is not None:
+                    cropper._auto_label_save(frame, cropper._template_bbox, sec_bbox)
 
-            # Draw tracking box on input frame for preview
+            # Crop and write (skip in training-only mode)
+            cropped = None
+            if not training_only:
+                cropped = cropper._crop_frame(frame, sx, sy)
+                writer.write(cropped)
+
+            # Draw tracking boxes on input frame for preview
             display_frame = frame.copy()
+            # Primary bot
             if cropper._template_bbox is not None:
                 bx, by, bw, bh = [int(v) for v in cropper._template_bbox]
                 color = (0, 255, 0) if lost == 0 else (0, 0, 255)
                 cv2.rectangle(display_frame, (bx, by), (bx + bw, by + bh), color, 3)
-                label = "TRACKING" if lost == 0 else "LOST"
+                label = "BOT 1 (TRACKING)" if lost == 0 else "BOT 1 (LOST)"
                 cv2.putText(display_frame, label, (bx, by - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2, cv2.LINE_AA)
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
+            # Secondary bot
+            if cropper._secondary_bbox is not None:
+                bx2, by2, bw2, bh2 = [int(v) for v in cropper._secondary_bbox]
+                cv2.rectangle(display_frame, (bx2, by2), (bx2 + bw2, by2 + bh2),
+                              (255, 165, 0), 2)  # orange
+                cv2.putText(display_frame, "BOT 2", (bx2, by2 - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 165, 0), 2, cv2.LINE_AA)
 
-            # Live preview — update both panels every frame
-            self._show_live_output_frame(cropped)
+            # Live preview
+            if cropped is not None:
+                self._show_live_output_frame(cropped)
             self.root.after(0, lambda f=display_frame:
                             self.input_preview.show_cv_frame(f))
 
             fi += 1
-            # Use total expected frames for progress
             total_expected = cropper._max_frames
             if fi % 20 == 0 or fi == total_expected:
                 e = time.time() - t0
                 pct = min(fi / max(total_expected, 1) * 100, 100)
                 fps = fi / max(e, 0.001)
                 st = "TRACKING" if lost == 0 else f"LOST ({lost}f)"
-                self._update_progress(pct, fps, f"Processing — {st}")
+                mode_str = "Training" if training_only else "Processing"
+                self._update_progress(pct, fps, f"{mode_str} — {st}")
 
             if fi % 100 == 0:
                 e = time.time() - t0
@@ -1015,13 +1061,15 @@ class SmartCropperGUI:
                 fps = fi / max(e, 0.001)
                 st = "TRACKING" if lost == 0 else f"LOST ({lost}f)"
                 tag = "progress" if lost == 0 else "warning"
+                lbl_info = f" | {cropper._label_count} labels" if cropper.auto_label else ""
                 self._log(f"  {fi}/{total_expected} ({pct:.0f}%) | "
-                          f"{fps:.1f} FPS | {st}", tag)
+                          f"{fps:.1f} FPS | {st}{lbl_info}", tag)
 
-        writer.release()
+        if writer is not None:
+            writer.release()
         cropper.cap.release()
 
-        # --- Always save whatever was processed (even on stop) ---
+        # --- Results ---
         if fi == 0:
             self._log("⚠️  No frames were processed.", "warning")
             self._update_progress(0, status="Nothing to save")
@@ -1031,21 +1079,35 @@ class SmartCropperGUI:
 
         e = time.time() - t0
         stopped_early = not self._processing
-        if stopped_early:
-            dur_secs = fi / cropper.fps if cropper.fps > 0 else 0
-            self._log(f"\n⏹  Stopped at {fi} frames ({dur_secs:.1f}s) in {e:.1f}s", "warning")
+
+        if training_only:
+            # Training mode: just report label stats
+            self._log(f"\n🏋  Training run complete: {fi} frames in {e:.1f}s "
+                      f"({fi / max(e, 0.001):.1f} FPS)", "success")
+            self._log(f"📊  {cropper._label_count} labeled frames saved to "
+                      f"{cropper._label_dataset_dir}", "success")
+            self._update_progress(100, status="Training complete!")
+            # Clean up silent file if it was created
+            if os.path.exists(silent):
+                os.remove(silent)
         else:
-            self._log(f"\n✅ {fi} frames in {e:.1f}s ({fi / max(e, 0.001):.1f} FPS)", "success")
+            if stopped_early:
+                dur_secs = fi / cropper.fps if cropper.fps > 0 else 0
+                self._log(f"\n⏹  Stopped at {fi} frames ({dur_secs:.1f}s) in {e:.1f}s", "warning")
+            else:
+                self._log(f"\n✅ {fi} frames in {e:.1f}s ({fi / max(e, 0.001):.1f} FPS)", "success")
 
-        self._update_progress(95, status="Muxing audio...")
-        self._log("🔊 Muxing audio...", "info")
-        cropper._mux_audio(cropper.input_path, silent, cropper.output_path)
-        self._log(f"🎉 Saved: {cropper.output_path}", "success")
-        self._update_progress(100, status="Complete!" if not stopped_early else "Saved (partial)")
+            self._update_progress(95, status="Muxing audio...")
+            self._log("🔊 Muxing audio...", "info")
+            cropper._mux_audio(cropper.input_path, silent, cropper.output_path)
+            self._log(f"🎉 Saved: {cropper.output_path}", "success")
+            self._update_progress(100, status="Complete!" if not stopped_early else "Saved (partial)")
 
-        # Load output for preview playback
-        out_path = cropper.output_path
-        self.root.after(100, lambda: self._load_output_preview(out_path))
+            if cropper._label_count > 0:
+                self._log(f"📊  Also saved {cropper._label_count} training labels", "info")
+
+            out_path = cropper.output_path
+            self.root.after(100, lambda: self._load_output_preview(out_path))
 
     def _load_output_preview(self, path):
         """Load the finished output video into the preview panel."""
