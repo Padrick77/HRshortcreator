@@ -24,6 +24,7 @@ import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import numpy as np
@@ -118,6 +119,64 @@ class ThreadedFrameWriter:
         """Signal the writer to finish and wait for it to drain."""
         self._queue.put(None)  # sentinel
         self._thread.join()
+
+
+class ThreadedLabelWriter:
+    """Writes training images + label files asynchronously in a background thread.
+
+    Downscales frames before saving (YOLO trains at 640px, so saving 4K is
+    wasteful and slow). Bounding box annotations are rescaled to match.
+    """
+
+    MAX_IMG_WIDTH = 1280  # downscale to this width before saving
+
+    def __init__(self, queue_size: int = 64):
+        self._queue: queue.Queue = queue.Queue(maxsize=queue_size)
+        self._thread = threading.Thread(target=self._writer_loop, daemon=True)
+        self._thread.start()
+
+    def _writer_loop(self):
+        while True:
+            item = self._queue.get()
+            if item is None:  # sentinel
+                break
+            img_path, lbl_path, frame, bboxes, class_id = item
+
+            # Downscale if too large
+            h, w = frame.shape[:2]
+            if w > self.MAX_IMG_WIDTH:
+                scale = self.MAX_IMG_WIDTH / w
+                frame = cv2.resize(frame, None, fx=scale, fy=scale,
+                                   interpolation=cv2.INTER_AREA)
+
+            # Write image (lower quality = faster encode, still fine for training)
+            cv2.imwrite(img_path, frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+
+            # Write label (normalised coords are scale-invariant)
+            img_h, img_w = h, w  # use original dimensions for normalisation
+            with open(lbl_path, "w") as f:
+                for bbox in bboxes:
+                    bx, by, bw, bh = [int(v) for v in bbox]
+                    cx_norm = (bx + bw / 2) / img_w
+                    cy_norm = (by + bh / 2) / img_h
+                    w_norm = bw / img_w
+                    h_norm = bh / img_h
+                    f.write(f"{class_id} {cx_norm:.6f} {cy_norm:.6f} "
+                            f"{w_norm:.6f} {h_norm:.6f}\n")
+
+    def submit(self, img_path, lbl_path, frame, bboxes, class_id):
+        """Queue a frame + bboxes for async writing."""
+        # Copy frame now so caller can reuse the buffer
+        self._queue.put((img_path, lbl_path, frame.copy(), bboxes, class_id))
+
+    def stop(self):
+        """Drain the queue and shut down."""
+        self._queue.put(None)
+        self._thread.join()
+
+    @property
+    def pending(self):
+        return self._queue.qsize()
 
 
 
@@ -265,11 +324,28 @@ class SmartCropper:
         # Padded tracker — CSRT works better with extra spatial context
         self._tracker_pad_ratio = 0.4  # pad each side by 40% of object size
 
+        # Tracking resolution cap — CSRT/flow run on downscaled frames for speed
+        self._track_max_width = 960
+        if self.src_width > self._track_max_width:
+            self._track_scale = self._track_max_width / self.src_width
+        else:
+            self._track_scale = 1.0
+        print(f"[INFO] Tracking scale: {self._track_scale:.2f}x "
+              f"({int(self.src_width * self._track_scale)}x"
+              f"{int(self.src_height * self._track_scale)})")
+
+        # Cached per-frame downscaled image (computed once, reused by all trackers)
+        self._small_frame = None
+
+        # Thread pool for parallel tracker updates
+        self._tracker_pool = ThreadPoolExecutor(max_workers=2)
+
         # Secondary tracker for the second bot (training labels only)
         self._secondary_tracker = None
         self._secondary_bbox: tuple | None = None  # (x, y, w, h)
         self._secondary_pad = None
         self._secondary_templates: collections.deque = collections.deque(maxlen=10)
+        self._secondary_lost_count = 0  # consecutive frames where CSRT failed
 
         # Training-only mode: skip video output, just collect labels
         self.training_only = training_only
@@ -281,6 +357,7 @@ class SmartCropper:
             os.path.dirname(os.path.abspath(__file__)), "training_data")
         self._label_count = 0
         self._label_class_id = 0  # YOLO class index for "bot"
+        self._label_writer: ThreadedLabelWriter | None = None  # lazy init
 
     # ----- geometry --------------------------------------------------------
 
@@ -441,37 +518,128 @@ class SmartCropper:
         self._init_csrt_tracker(frame, primary_bbox)
         self._save_template(frame, primary_bbox)
 
-        # --- Bot 2: Secondary (training labels only) ---
-        # Draw bot 1 on the display so user can see it
-        disp2 = display_frame.copy()
-        sx1, sy1 = int(x * scale), int(y * scale)
-        sw, sh = int(w * scale), int(h * scale)
-        cv2.rectangle(disp2, (sx1, sy1), (sx1 + sw, sy1 + sh), (0, 255, 0), 2)
-        cv2.putText(disp2, "BOT 1 (PRIMARY)", (sx1, sy1 - 8),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
-
-        print("[INFO] Now draw a rectangle around the SECOND bot.")
-        print("       Press ENTER/SPACE to confirm, or 'C' to skip.")
-        roi2 = cv2.selectROI("BOT 2 (SECONDARY) — draw box, ENTER to confirm, C to skip",
-                             disp2, fromCenter=False, showCrosshair=True)
-        cv2.destroyAllWindows()
-
-        if roi2 != (0, 0, 0, 0):
-            x2, y2, w2, h2 = roi2
-            x2 = int(x2 / scale)
-            y2 = int(y2 / scale)
-            w2 = int(w2 / scale)
-            h2 = int(h2 / scale)
-            secondary_bbox = (x2, y2, w2, h2)
-            print(f"[INFO] Secondary bot selected: x={x2}, y={y2}, w={w2}, h={h2}")
-            self._init_secondary_tracker(frame, secondary_bbox)
-        else:
-            print("[INFO] Secondary bot skipped.")
-
         return self.MODE_MANUAL, None
 
     def _init_secondary_tracker(self, frame, bbox):
-        """Create a CSRT tracker for the second bot (training labels only)."""
+        """Save the secondary bot's initial template for on-demand locating.
+
+        Instead of continuous CSRT tracking (which drifts), we use template
+        matching to re-detect the second bot only at label-save time.
+        This is more robust and much faster.
+        """
+        x, y, w, h = [int(v) for v in bbox]
+        self._secondary_bbox = (x, y, w, h)
+        self._secondary_size = (w, h)  # reference size for output bboxes
+
+        # Mark that we have a secondary target
+        self._secondary_tracker = True  # just a flag now, not a tracker object
+
+        # Save template — NO padding, just the bot itself for clean matching
+        y1 = max(0, y)
+        y2 = min(frame.shape[0], y + h)
+        x1 = max(0, x)
+        x2 = min(frame.shape[1], x + w)
+        template = frame[y1:y2, x1:x2].copy()
+        if template.size > 0:
+            self._secondary_templates.append(template)
+
+        print(f"[INFO] Secondary bot template saved: {w}x{h} at ({x},{y})")
+
+    def _find_secondary_bot(self, frame) -> tuple | None:
+        """Locate the secondary bot in the current frame via template matching.
+
+        Searches the full frame. Returns a bbox using the ORIGINAL bot size
+        (from user selection), not the match region size. This prevents
+        the output bbox from being inflated by scale/padding.
+        Only called at label-save time (~every 15 frames).
+        """
+        if not self._secondary_templates:
+            return self._secondary_bbox
+
+        # Known bot dimensions from user selection
+        ref_w, ref_h = self._secondary_size
+
+        # Use the most recent template
+        tmpl = self._secondary_templates[-1]
+        tmpl_gray = cv2.cvtColor(tmpl, cv2.COLOR_BGR2GRAY)
+
+        # Downscale the search frame for speed (template match on ~1280px)
+        search_scale = min(1280 / frame.shape[1], 1.0)
+        if search_scale < 1.0:
+            search_frame = cv2.resize(frame, None, fx=search_scale,
+                                      fy=search_scale,
+                                      interpolation=cv2.INTER_AREA)
+        else:
+            search_frame = frame
+        search_gray = cv2.cvtColor(search_frame, cv2.COLOR_BGR2GRAY)
+
+        best_score = 0.0
+        best_center = None
+
+        # Try a few scales (narrow range — bots don't change size much)
+        for scale in [0.8, 1.0, 1.2]:
+            tw = int(tmpl_gray.shape[1] * scale * search_scale)
+            th = int(tmpl_gray.shape[0] * scale * search_scale)
+            if tw >= search_gray.shape[1] or th >= search_gray.shape[0]:
+                continue
+            if tw < 8 or th < 8:
+                continue
+
+            scaled_tmpl = cv2.resize(tmpl_gray, (tw, th))
+            result = cv2.matchTemplate(search_gray, scaled_tmpl,
+                                       cv2.TM_CCOEFF_NORMED)
+            _, max_val, _, max_loc = cv2.minMaxLoc(result)
+            if max_val > best_score:
+                best_score = max_val
+                # Calculate center of match in search-res coords
+                best_center = (max_loc[0] + tw / 2, max_loc[1] + th / 2)
+
+        if best_score < 0.45 or best_center is None:
+            return None  # not confident enough — skip labeling this frame
+
+        # Convert center back to full resolution, use KNOWN bot size
+        cx = best_center[0] / search_scale
+        cy = best_center[1] / search_scale
+        x = int(cx - ref_w / 2)
+        y = int(cy - ref_h / 2)
+
+        # Clamp to frame bounds
+        x = max(0, min(x, frame.shape[1] - ref_w))
+        y = max(0, min(y, frame.shape[0] - ref_h))
+
+        # Avoid returning a position too close to the primary bot
+        if self._template_bbox is not None:
+            px, py, pw, ph = self._template_bbox
+            pcx, pcy = px + pw / 2, py + ph / 2
+            scx, scy = x + ref_w / 2, y + ref_h / 2
+            dist = ((pcx - scx) ** 2 + (pcy - scy) ** 2) ** 0.5
+            if dist < max(pw, ph) * 1.5:
+                return None  # too close to primary — probably matched the same bot
+
+        # Color histogram sanity check: does the match LOOK like the template?
+        match_region = frame[max(0, y):min(frame.shape[0], y + ref_h),
+                             max(0, x):min(frame.shape[1], x + ref_w)]
+        if match_region.size > 0 and self._secondary_templates:
+            ref_tmpl = self._secondary_templates[0]  # original template
+            ref_hsv = cv2.cvtColor(ref_tmpl, cv2.COLOR_BGR2HSV)
+            match_hsv = cv2.cvtColor(match_region, cv2.COLOR_BGR2HSV)
+            ref_hist = cv2.calcHist([ref_hsv], [0, 1], None, [16, 16], [0, 180, 0, 256])
+            match_hist = cv2.calcHist([match_hsv], [0, 1], None, [16, 16], [0, 180, 0, 256])
+            cv2.normalize(ref_hist, ref_hist, 0, 1, cv2.NORM_MINMAX)
+            cv2.normalize(match_hist, match_hist, 0, 1, cv2.NORM_MINMAX)
+            color_score = cv2.compareHist(ref_hist, match_hist, cv2.HISTCMP_CORREL)
+            if color_score < 0.3:
+                return None  # color mismatch — not the right bot
+
+        self._secondary_bbox = (x, y, ref_w, ref_h)
+        return (x, y, ref_w, ref_h)
+
+    def _init_csrt_tracker(self, frame, bbox):
+        """Create and initialize a CSRT (or KCF fallback) tracker.
+
+        Uses a padded bounding box so CSRT has more spatial context.
+        Operates on a downscaled frame for speed (coords scaled back on update).
+        """
         tracker = None
         for factory_name in [
             "cv2.TrackerCSRT.create",
@@ -480,83 +648,6 @@ class SmartCropper:
             "cv2.legacy.TrackerKCF_create",
         ]:
             parts = factory_name.split(".")
-            obj = __import__(parts[0])
-            try:
-                for attr in parts[1:]:
-                    obj = getattr(obj, attr)
-                tracker = obj()
-                break
-            except AttributeError:
-                continue
-
-        if tracker is None:
-            print("[WARN] Could not create secondary tracker.")
-            return
-
-        x, y, w, h = [int(v) for v in bbox]
-        self._secondary_bbox = (x, y, w, h)
-
-        # Pad for better tracking
-        pad_x = int(w * self._tracker_pad_ratio)
-        pad_y = int(h * self._tracker_pad_ratio)
-        px = max(0, x - pad_x)
-        py = max(0, y - pad_y)
-        pw = min(frame.shape[1] - px, w + 2 * pad_x)
-        ph = min(frame.shape[0] - py, h + 2 * pad_y)
-        self._secondary_pad = (x - px, y - py, w, h)
-
-        self._secondary_tracker = tracker
-        self._secondary_tracker.init(frame, (px, py, pw, ph))
-        print(f"[INFO] Secondary tracker initialized.")
-
-        # Save initial template
-        pad = int(max(w, h) * 0.15)
-        y1 = max(0, y - pad)
-        y2 = min(frame.shape[0], y + h + pad)
-        x1 = max(0, x - pad)
-        x2 = min(frame.shape[1], x + w + pad)
-        template = frame[y1:y2, x1:x2].copy()
-        if template.size > 0:
-            self._secondary_templates.append(template)
-
-    def _update_secondary_tracker(self, frame) -> tuple | None:
-        """Update the secondary bot tracker and return its bbox, or None."""
-        if self._secondary_tracker is None:
-            return None
-
-        success, padded_bbox = self._secondary_tracker.update(frame)
-        if not success:
-            return self._secondary_bbox  # hold last position
-
-        px, py, pw, ph = [int(v) for v in padded_bbox]
-        if self._secondary_pad is not None:
-            off_x, off_y, ow, oh = self._secondary_pad
-            x = px + off_x
-            y = py + off_y
-            w = ow
-            h = oh
-        else:
-            x, y, w, h = px, py, pw, ph
-
-        self._secondary_bbox = (x, y, w, h)
-        return (x, y, w, h)
-
-    def _init_csrt_tracker(self, frame, bbox):
-        """Create and initialize a CSRT (or KCF fallback) tracker.
-
-        Uses a padded bounding box so CSRT has more spatial context,
-        which significantly improves tracking of small objects.
-        """
-        tracker = None
-        # Try CSRT first (best quality), then KCF fallback.
-        # Newer OpenCV versions moved contrib trackers into cv2.legacy.
-        for factory_name in [
-            "cv2.TrackerCSRT.create",
-            "cv2.legacy.TrackerCSRT_create",
-            "cv2.TrackerKCF.create",
-            "cv2.legacy.TrackerKCF_create",
-        ]:
-            parts = factory_name.split(".")  
             obj = __import__(parts[0])
             try:
                 for attr in parts[1:]:
@@ -573,31 +664,48 @@ class SmartCropper:
                 "Install opencv-contrib-python: pip install opencv-contrib-python"
             )
 
-        # Store the true (unpadded) object bbox
+        # Store the true (unpadded) object bbox at full resolution
         x, y, w, h = [int(v) for v in bbox]
         self._template_bbox = (x, y, w, h)
         self._manual_last_cx = float(x + w / 2)
 
-        # Save original size reference on first init
         if self._original_bbox is None:
             self._original_bbox = (x, y, w, h)
 
-        # Pad the tracker region for better context (helps small objects)
+        # Pad the tracker region for better context
         pad_x = int(w * self._tracker_pad_ratio)
         pad_y = int(h * self._tracker_pad_ratio)
         px = max(0, x - pad_x)
         py = max(0, y - pad_y)
         pw = min(frame.shape[1] - px, w + 2 * pad_x)
         ph = min(frame.shape[0] - py, h + 2 * pad_y)
-        self._tracker_pad = (x - px, y - py, w, h)  # offset to get true box from padded
+        # Store pad offsets at FULL resolution
+        self._tracker_pad = (x - px, y - py, w, h)
+
+        # Downscale for tracker init (CSRT is O(pixels) — huge speedup on 4K)
+        s = self._track_scale
+        if s < 1.0:
+            small = cv2.resize(frame, None, fx=s, fy=s,
+                               interpolation=cv2.INTER_AREA)
+            spx = int(px * s)
+            spy = int(py * s)
+            spw = int(pw * s)
+            sph = int(ph * s)
+            # Store pad offsets at SCALED resolution for unpadding on update
+            self._tracker_pad_scaled = (int((x - px) * s), int((y - py) * s),
+                                        int(w * s), int(h * s))
+        else:
+            small = frame
+            spx, spy, spw, sph = px, py, pw, ph
+            self._tracker_pad_scaled = self._tracker_pad
 
         self._opencv_tracker = tracker
-        self._opencv_tracker.init(frame, (px, py, pw, ph))
+        self._opencv_tracker.init(small, (spx, spy, spw, sph))
 
-        # Initialize optical flow points inside the target region
-        self._init_flow_points(frame, (x, y, w, h))
+        # Initialize optical flow points on the downscaled frame
+        self._init_flow_points(small, (spx, spy, int(w * s), int(h * s)))
 
-        # Save reference histogram for drift detection
+        # Save reference histogram for drift detection (full res)
         if self._ref_histogram is None:
             self._ref_histogram = self._compute_histogram(frame, bbox)
 
@@ -639,55 +747,59 @@ class SmartCropper:
             self._ref_histogram = 0.8 * self._ref_histogram + 0.2 * new_hist
 
     def _auto_label_save(self, frame, primary_bbox, secondary_bbox=None):
-        """Save a frame + YOLO-format annotations for both bots.
+        """Queue a frame + YOLO-format annotations for async background writing.
 
-        Only called during confident tracking (no drift detected).
-        Annotations use normalised xywh format per YOLO spec.
-        Each bot is a separate line in the label file.
+        Uses ThreadedLabelWriter to downscale and write on a background thread
+        so the tracking loop is never blocked by JPEG encoding or disk I/O.
         """
         if not self.auto_label:
             return
 
-        img_h, img_w = frame.shape[:2]
+        # Lazy-init the threaded writer
+        if self._label_writer is None:
+            self._label_writer = ThreadedLabelWriter(queue_size=64)
 
         # Collect all valid bboxes
         bboxes = [primary_bbox]
         if secondary_bbox is not None:
             bboxes.append(secondary_bbox)
 
-        # Ensure the dataset directory exists
+        # Ensure the dataset directory exists (only on first call)
         img_dir = os.path.join(self._label_dataset_dir, "images", "train")
         lbl_dir = os.path.join(self._label_dataset_dir, "labels", "train")
-        os.makedirs(img_dir, exist_ok=True)
-        os.makedirs(lbl_dir, exist_ok=True)
+        if self._label_count == 0:
+            os.makedirs(img_dir, exist_ok=True)
+            os.makedirs(lbl_dir, exist_ok=True)
 
-        # Generate a unique filename using video name + frame count
+        # Generate a unique filename
         video_stem = os.path.splitext(os.path.basename(self.input_path))[0]
         safe_stem = "".join(c if c.isalnum() or c in "-_" else "_" for c in video_stem)
         fname = f"{safe_stem}_{self._label_count:05d}"
 
-        # Save image
         img_path = os.path.join(img_dir, f"{fname}.jpg")
-        cv2.imwrite(img_path, frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
-
-        # Save label (one line per bot)
         lbl_path = os.path.join(lbl_dir, f"{fname}.txt")
-        with open(lbl_path, "w") as f:
-            for bbox in bboxes:
-                x, y, w, h = [int(v) for v in bbox]
-                cx_norm = (x + w / 2) / img_w
-                cy_norm = (y + h / 2) / img_h
-                w_norm = w / img_w
-                h_norm = h / img_h
-                f.write(f"{self._label_class_id} {cx_norm:.6f} {cy_norm:.6f} "
-                        f"{w_norm:.6f} {h_norm:.6f}\n")
+
+        # Submit to background thread (copies frame internally)
+        self._label_writer.submit(img_path, lbl_path, frame, bboxes,
+                                  self._label_class_id)
 
         self._label_count += 1
         if self._label_count == 1:
             print(f"[AUTOLABEL] Saving training data to: {self._label_dataset_dir}")
             print(f"[AUTOLABEL] Labeling {len(bboxes)} bot(s) per frame")
+            print(f"[AUTOLABEL] Frames downscaled to {ThreadedLabelWriter.MAX_IMG_WIDTH}px & written async")
         if self._label_count % 50 == 0:
-            print(f"[AUTOLABEL] {self._label_count} labeled frames saved")
+            pending = self._label_writer.pending
+            print(f"[AUTOLABEL] {self._label_count} labeled frames queued"
+                  f" ({pending} pending write)")
+
+    def _stop_label_writer(self):
+        """Drain and shut down the background label writer."""
+        if self._label_writer is not None:
+            print(f"[AUTOLABEL] Flushing {self._label_writer.pending} pending writes...")
+            self._label_writer.stop()
+            self._label_writer = None
+            print(f"[AUTOLABEL] Done. {self._label_count} total frames saved.")
 
     def _compute_histogram(self, frame, bbox):
         """Compute an HSV color histogram for the region inside bbox."""
@@ -710,6 +822,7 @@ class SmartCropper:
         Uses adaptive thresholds based on object size — small objects get
         more lenient thresholds since their patches are noisier.
         Requires at least 2 out of 3 checks to fail before declaring drift.
+        Only runs full checks every 5 frames for performance.
         """
         # Cooldown after re-acquisition — let tracker stabilize
         if self._drift_cooldown > 0:
@@ -725,9 +838,8 @@ class SmartCropper:
         obj_area = w * h
         frame_area = frame.shape[0] * frame.shape[1]
         area_ratio = obj_area / max(frame_area, 1)
-        # Objects < 1% of frame area get substantially relaxed thresholds
         if area_ratio < 0.01:
-            drift_thresh = self._drift_threshold * 0.5  # much more lenient
+            drift_thresh = self._drift_threshold * 0.5
             tmpl_thresh = self._drift_tmpl_threshold * 0.3
             jump_ratio = self._max_jump_ratio * 1.5
         elif area_ratio < 0.03:
@@ -739,7 +851,7 @@ class SmartCropper:
             tmpl_thresh = self._drift_tmpl_threshold
             jump_ratio = self._max_jump_ratio
 
-        # --- Check 1: Position jump ---
+        # --- Check 1: Position jump (cheap — always run) ---
         if self._prev_center is not None:
             px, py = self._prev_center
             dx = abs(cx - px)
@@ -773,15 +885,18 @@ class SmartCropper:
                     fail_count += 1
                     fail_reasons.append(f"color={hist_score:.2f}")
 
-        # --- Check 3: Template structural match ---
+        # --- Check 3: Template structural match (most expensive) ---
+        # Skip if histogram match is strong (no sign of drift)
         tmpl_score = 1.0
-        if self._templates:
+        if self._templates and hist_score < drift_thresh + 0.15:
             region = frame[max(0, y):min(frame.shape[0], y + h),
                           max(0, x):min(frame.shape[1], x + w)]
             if region.size > 0:
                 region_gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
                 best_tmpl_score = 0.0
-                for tmpl in self._templates:
+                # Only compare against the 3 most recent templates
+                recent = list(self._templates)[-3:]
+                for tmpl in recent:
                     tmpl_gray = cv2.cvtColor(tmpl, cv2.COLOR_BGR2GRAY)
                     tmpl_resized = cv2.resize(tmpl_gray,
                                               (region_gray.shape[1], region_gray.shape[0]))
@@ -901,7 +1016,15 @@ class SmartCropper:
                 or len(self._flow_points) < 3):
             return None
 
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        # Flow operates at tracking resolution
+        s = self._track_scale
+        if s < 1.0:
+            small = cv2.resize(frame, None, fx=s, fy=s,
+                               interpolation=cv2.INTER_AREA)
+        else:
+            small = frame
+
+        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
         new_pts, status, _ = cv2.calcOpticalFlowPyrLK(
             self._flow_prev_gray, gray, self._flow_points, None,
             **self._lk_params)
@@ -929,11 +1052,11 @@ class SmartCropper:
 
         inlier_pts = new_good[inlier_mask].reshape(-1, 2)
 
-        # Compute bounding box of tracked points
+        # Compute bounding box of tracked points (at scaled res)
         min_x, min_y = inlier_pts.min(axis=0)
         max_x, max_y = inlier_pts.max(axis=0)
 
-        # Use original object size as reference (flow points may be sparse)
+        # Use original object size as reference (full res)
         if self._original_bbox is not None:
             _, _, ow, oh = self._original_bbox
         elif self._template_bbox is not None:
@@ -941,12 +1064,15 @@ class SmartCropper:
         else:
             return None
 
-        cx = (min_x + max_x) / 2
-        cy = (min_y + max_y) / 2
+        # Center is at scaled res — convert to full res
+        cx_scaled = (min_x + max_x) / 2
+        cy_scaled = (min_y + max_y) / 2
+        cx = cx_scaled / s
+        cy = cy_scaled / s
         x = int(cx - ow / 2)
         y = int(cy - oh / 2)
 
-        # Validate: the flow region should be roughly where we expect
+        # Validate: the flow region should be roughly where we expect (full res)
         if self._template_bbox is not None:
             lx, ly, lw, lh = self._template_bbox
             dist = np.sqrt((cx - (lx + lw / 2)) ** 2 + (cy - (ly + lh / 2)) ** 2)
@@ -985,20 +1111,39 @@ class SmartCropper:
 
         Uses padded tracking with drift detection. Falls back to optical
         flow and template re-acquisition when CSRT loses the target.
+        Tracker runs on a downscaled frame for speed; coords are scaled back.
         """
-        success, padded_bbox = self._opencv_tracker.update(frame)
+        # Downscale ONCE per frame — reused by primary and flow
+        s = self._track_scale
+        if s < 1.0:
+            small = cv2.resize(frame, None, fx=s, fy=s,
+                               interpolation=cv2.INTER_AREA)
+        else:
+            small = frame
+        self._small_frame = small
+
+        success, padded_bbox = self._opencv_tracker.update(small)
 
         if success:
-            # Unpad: extract the true object bbox from the padded tracker result
+            # Unpad using SCALED offsets, then scale back to full res
             px, py, pw, ph = [int(v) for v in padded_bbox]
-            if hasattr(self, '_tracker_pad'):
-                off_x, off_y, ow, oh = self._tracker_pad
-                x = px + off_x
-                y = py + off_y
-                w = ow
-                h = oh
+            if hasattr(self, '_tracker_pad_scaled'):
+                off_x, off_y, ow, oh = self._tracker_pad_scaled
+                sx = px + off_x
+                sy = py + off_y
+                sw = ow
+                sh = oh
             else:
-                x, y, w, h = px, py, pw, ph
+                sx, sy, sw, sh = px, py, pw, ph
+
+            # Scale back to full resolution
+            if s < 1.0:
+                x = int(sx / s)
+                y = int(sy / s)
+                w = int(sw / s)
+                h = int(sh / s)
+            else:
+                x, y, w, h = sx, sy, sw, sh
 
             # --- Drift detection: is CSRT still on the right object? ---
             self._frames_tracked_ok += 1
@@ -1011,34 +1156,35 @@ class SmartCropper:
                 self._manual_last_cx = cx
                 self._template_bbox = (x, y, w, h)
 
-                # Update optical flow tracking
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                # Update optical flow tracking (on downscaled frame for speed)
+                small_gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
                 if self._flow_points is not None and self._flow_prev_gray is not None:
                     new_pts, status, _ = cv2.calcOpticalFlowPyrLK(
-                        self._flow_prev_gray, gray, self._flow_points, None,
+                        self._flow_prev_gray, small_gray, self._flow_points, None,
                         **self._lk_params)
                     if new_pts is not None and status is not None:
                         good = status.flatten() == 1
                         if good.sum() > 0:
                             self._flow_points = new_pts[good].reshape(-1, 1, 2)
 
-                    # Refresh flow points every 30 frames to avoid depletion
                     if (self._frames_tracked_ok % 30 == 0
                             or (self._flow_points is not None
                                 and len(self._flow_points) < 5)):
-                        self._init_flow_points(frame, (x, y, w, h))
+                        self._init_flow_points(small, (int(x * s), int(y * s),
+                                                       int(w * s), int(h * s)))
                     else:
-                        self._flow_prev_gray = gray
+                        self._flow_prev_gray = small_gray
                 else:
-                    self._init_flow_points(frame, (x, y, w, h))
+                    self._init_flow_points(small, (int(x * s), int(y * s),
+                                                   int(w * s), int(h * s)))
 
-                # Save templates while tracking is good (more frequently)
+                # Save templates while tracking is good
                 if self._frames_tracked_ok % self._template_save_interval == 0:
                     self._save_template(frame, (x, y, w, h))
 
-                # Update secondary tracker and auto-label both bots
-                sec_bbox = self._update_secondary_tracker(frame)
+                # Auto-label: find secondary bot via template match (not CSRT)
                 if self._frames_tracked_ok % self._label_save_interval == 0:
+                    sec_bbox = self._find_secondary_bot(frame) if self._secondary_tracker else None
                     self._auto_label_save(frame, (x, y, w, h), sec_bbox)
 
                 return cx, cy
@@ -1258,6 +1404,7 @@ class SmartCropper:
         writer.stop()
         cv_writer.release()
         self.cap.release()
+        self._stop_label_writer()
 
         elapsed = time.time() - t_start
         print(f"\n[INFO] Video processing complete: {frame_idx} frames in {elapsed:.1f}s "

@@ -37,3 +37,6 @@ Thumbs.db
 
 # Downloads directory
 downloads/
+
+# Training data
+training_data/

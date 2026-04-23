@@ -920,6 +920,64 @@ class SmartCropperGUI:
         self._log("👆 Select target in the popup window...", "info")
 
         while self._processing:
+            # --- Check for inline ROI drag (works even while paused) ---
+            if self._pending_roi is not None:
+                # Need a frame to re-init the tracker on — read one if needed
+                if self._current_frame is None:
+                    ret, frame = cropper.cap.read()
+                    if ret:
+                        self._current_frame = frame
+                if self._current_frame is not None:
+                    new_roi = self._pending_roi
+                    self._pending_roi = None
+                    cropper._init_csrt_tracker(self._current_frame, new_roi)
+                    cropper._save_template(self._current_frame, new_roi)
+                    cropper._tracking_mode = cropper.MODE_MANUAL
+                    cropper._prev_center = None
+                    cropper._frames_tracked_ok = 0
+                    cropper._drift_cooldown = 20
+                    lost = 0
+                    self._log("\u2705 Tracker re-synced to new position.", "success")
+                    # Auto-resume if paused so tracking continues immediately
+                    if self._paused:
+                        self._paused = False
+                        self.root.after(0, lambda: self.pause_btn.config(
+                            text="⏸  Pause", bg=C["yellow"]))
+                        self._log("▶  Auto-resumed after redraw.", "success")
+                    continue
+                else:
+                    self._pending_roi = None  # discard if no frame available
+
+            # --- Check for reselect button request (works even while paused) ---
+            if self._reselect_requested:
+                self._reselect_requested = False
+                # Need a frame for the selection UI
+                if self._current_frame is None:
+                    ret, frame = cropper.cap.read()
+                    if ret:
+                        self._current_frame = frame
+                if self._current_frame is not None:
+                    self._update_progress(pct=0, status="Reselecting target...")
+                    self._log("\u27f3 Draw a new box around the target...", "info")
+                    try:
+                        _, _ = cropper._manual_roi_select(self._current_frame)
+                        cropper._prev_center = None
+                        cropper._frames_tracked_ok = 0
+                        cropper._drift_cooldown = 20
+                        lost = 0
+                        self._log("\u2705 Target reselected! Resuming...", "success")
+                        self._update_progress(pct=0, status="Training..." if training_only else "Processing...")
+                        self.root.after(0, lambda: self.reselect_btn.config(state="normal"))
+                        # Auto-resume if paused
+                        if self._paused:
+                            self._paused = False
+                            self.root.after(0, lambda: self.pause_btn.config(
+                                text="⏸  Pause", bg=C["yellow"]))
+                    except SystemExit:
+                        self._log("\u26a0\ufe0f Reselect cancelled, continuing with current target.", "warning")
+                        self.root.after(0, lambda: self.reselect_btn.config(state="normal"))
+                    continue
+
             if self._paused:
                 time.sleep(0.05)
                 continue
@@ -934,9 +992,11 @@ class SmartCropperGUI:
                 cropper._drift_cooldown = 10
                 self._log(f"⏩ Jumped to frame {target} — continuing from there.", "info")
 
+
             ret, frame = cropper.cap.read()
             if not ret:
                 break
+            self._current_frame = frame  # stash for potential redraw while paused
             frames_into_clip = int(cropper.cap.get(cv2.CAP_PROP_POS_FRAMES)) - cropper._start_frame
             if cropper.duration > 0 and frames_into_clip > cropper._max_frames:
                 break
@@ -962,39 +1022,6 @@ class SmartCropperGUI:
             else:
                 center = cropper._get_target_center_manual(frame)
 
-            # --- Check for inline ROI drag ---
-            if self._pending_roi is not None:
-                new_roi = self._pending_roi
-                self._pending_roi = None
-                cropper._init_csrt_tracker(frame, new_roi)
-                cropper._save_template(frame, new_roi)
-                cropper._tracking_mode = cropper.MODE_MANUAL
-                cropper._prev_center = None
-                cropper._frames_tracked_ok = 0
-                cropper._drift_cooldown = 20
-                lost = 0
-                self._log("\u2705 Tracker re-synced to new position.", "success")
-                continue
-
-            # --- Check for reselect button request ---
-            if self._reselect_requested:
-                self._reselect_requested = False
-                self._update_progress(pct=0, status="Reselecting target...")
-                self._log("\u27f3 Draw a new box around the target...", "info")
-                try:
-                    _, _ = cropper._manual_roi_select(frame)
-                    cropper._prev_center = None
-                    cropper._frames_tracked_ok = 0
-                    cropper._drift_cooldown = 20
-                    lost = 0
-                    self._log("\u2705 Target reselected! Resuming...", "success")
-                    self._update_progress(pct=0, status="Training..." if training_only else "Processing...")
-                    self.root.after(0, lambda: self.reselect_btn.config(state="normal"))
-                except SystemExit:
-                    self._log("\u26a0\ufe0f Reselect cancelled, continuing with current target.", "warning")
-                    self.root.after(0, lambda: self.reselect_btn.config(state="normal"))
-                continue
-
             if center is not None:
                 sx = cropper.smoother_x.update(center[0])
                 sy = cropper.smoother_y.update(center[1])
@@ -1008,11 +1035,11 @@ class SmartCropperGUI:
                 if sy is None:
                     sy = cropper.src_height / 2.0
 
-            # Update secondary tracker + auto-label (for YOLO mode;
+            # Auto-label (for YOLO mode;
             # manual mode handles this internally via _get_target_center_manual)
             if cropper._tracking_mode == cropper.MODE_YOLO:
-                sec_bbox = cropper._update_secondary_tracker(frame)
                 if fi % cropper._label_save_interval == 0 and cropper._template_bbox is not None:
+                    sec_bbox = cropper._find_secondary_bot(frame) if cropper._secondary_tracker else None
                     cropper._auto_label_save(frame, cropper._template_bbox, sec_bbox)
 
             # Crop and write (skip in training-only mode)
@@ -1021,29 +1048,44 @@ class SmartCropperGUI:
                 cropped = cropper._crop_frame(frame, sx, sy)
                 writer.write(cropped)
 
-            # Draw tracking boxes on input frame for preview
-            display_frame = frame.copy()
-            # Primary bot
-            if cropper._template_bbox is not None:
-                bx, by, bw, bh = [int(v) for v in cropper._template_bbox]
-                color = (0, 255, 0) if lost == 0 else (0, 0, 255)
-                cv2.rectangle(display_frame, (bx, by), (bx + bw, by + bh), color, 3)
-                label = "BOT 1 (TRACKING)" if lost == 0 else "BOT 1 (LOST)"
-                cv2.putText(display_frame, label, (bx, by - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
-            # Secondary bot
-            if cropper._secondary_bbox is not None:
-                bx2, by2, bw2, bh2 = [int(v) for v in cropper._secondary_bbox]
-                cv2.rectangle(display_frame, (bx2, by2), (bx2 + bw2, by2 + bh2),
-                              (255, 165, 0), 2)  # orange
-                cv2.putText(display_frame, "BOT 2", (bx2, by2 - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 165, 0), 2, cv2.LINE_AA)
+            # Draw tracking boxes and update preview (throttled — every 3 frames)
+            if fi % 3 == 0:
+                # Use full-size frame so canvas_to_source maps back to real
+                # source coordinates (needed for inline ROI redraw).
+                # In training-only mode, downscale for speed since we don't
+                # need accurate coordinate mapping from the preview.
+                if training_only:
+                    preview_scale = min(640 / frame.shape[1], 360 / frame.shape[0], 1.0)
+                    if preview_scale < 1.0:
+                        display_frame = cv2.resize(frame, None, fx=preview_scale,
+                                                   fy=preview_scale,
+                                                   interpolation=cv2.INTER_AREA)
+                    else:
+                        display_frame = frame.copy()
+                else:
+                    preview_scale = 1.0
+                    display_frame = frame.copy()
 
-            # Live preview
-            if cropped is not None:
-                self._show_live_output_frame(cropped)
-            self.root.after(0, lambda f=display_frame:
-                            self.input_preview.show_cv_frame(f))
+                # Primary bot
+                if cropper._template_bbox is not None:
+                    bx, by, bw, bh = [int(v * preview_scale) for v in cropper._template_bbox]
+                    color = (0, 255, 0) if lost == 0 else (0, 0, 255)
+                    cv2.rectangle(display_frame, (bx, by), (bx + bw, by + bh), color, 2)
+                    label = "BOT 1" if lost == 0 else "BOT 1 (LOST)"
+                    cv2.putText(display_frame, label, (bx, by - 6),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
+                # Secondary bot
+                if cropper._secondary_bbox is not None:
+                    bx2, by2, bw2, bh2 = [int(v * preview_scale) for v in cropper._secondary_bbox]
+                    cv2.rectangle(display_frame, (bx2, by2), (bx2 + bw2, by2 + bh2),
+                                  (255, 165, 0), 2)
+                    cv2.putText(display_frame, "BOT 2", (bx2, by2 - 6),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 165, 0), 1, cv2.LINE_AA)
+
+                if cropped is not None:
+                    self._show_live_output_frame(cropped)
+                self.root.after(0, lambda f=display_frame:
+                                self.input_preview.show_cv_frame(f))
 
             fi += 1
             total_expected = cropper._max_frames
@@ -1079,6 +1121,9 @@ class SmartCropperGUI:
 
         e = time.time() - t0
         stopped_early = not self._processing
+
+        # Flush any pending label writes
+        cropper._stop_label_writer()
 
         if training_only:
             # Training mode: just report label stats
